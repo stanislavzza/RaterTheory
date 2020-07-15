@@ -1,0 +1,848 @@
+---
+title: "Modeling Raters and Ratings"
+author: "D. Eubanks"
+date: "7/12/2020"
+output:
+  pdf_document: 
+    keep_tex: yes
+header-includes:
+- \usepackage{tikz} 
+- \usepackage{tikz-cd}
+- \usepackage{pgfplots}
+- \pgfplotsset{compat=1.16} 
+abstract: "This study analyzes binary categorical ratings using binomial mixture models to induce latent rater accuracy, true class probability, and a correct guess rate. The models make explicit an assumption that knowledge is justified true belief, integrating reliability and validity in a single framework. Bayesian inference is shown to recover parameters with simulated data for general and hierarchical models. An expert rater assumption is shown to entail an extension of the Fleiss inter-rater kappa statistic. The method is illustrated with two real data sets: wine tasting and college student writing ability. The Kappa Paradox is analyzed from this new perspective. \\par \\textbf{Keywords:} inter-rater agreement, categorical data analysis, Fleiss kappa, epistemology."
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(cache = FALSE)
+knitr::opts_chunk$set(dev = "postscript") # loses transparency
+knitr::opts_chunk$set(fig.path = "images/")
+
+library(tidyverse)
+library(knitr)
+library(FUReliability)
+library(rstan)
+library(shinystan)
+library(lme4)
+library(tidybayes)
+library(bootstrap)
+library(cowplot)
+library(xtable)
+
+source("code/likelihood.R")
+source("code/generate_ratings.R")
+source("code/kappa.R")
+source("code/plot_distributions.R")
+source("code/dasl.R")
+
+regenerate <- FALSE
+
+```
+# Introduction
+
+The goal of this study is to model categorical assignments, often made by human observers, to better understand their reliability and validity. Understanding such data allows us to make informed judgments about medical tests and diagnoses, student achievement measures, product reviews, and so on. We would like to have answers to questions like "can wine judges really discern quality?" and "can new doctors tell the difference between a cold and the flu?" Throughout the paper I will use "rater" and "ratings" as convenient terms for some agent that categorizes observations into nominal data, but the categories need not be ordinal.
+
+The data type we consider here has three components: ratings (categorical assignments), raters (observers who make the classifications), and the subjects being rated. The ratings are assumed to be made independently. The simplest models assume that there are a constant number of raters, and that each subject is rated by each rater, but these conditions can be relaxed.
+
+The rater/subject/rating structure naturally leads to a hierarchical analyses, comparing within-subject statistics to between-subject values. Intuitively, rater agreement is a sign of reliability, analogous to error variance, which is traditionally distinct from validity. In educational measurement, validity theory comprises a substantial body of work that is outlined in \cite{brennan2006educational}, and includes comparing ratings to other sources (convergent and discriminant validity), correlational structure (construct validity), and the use of ratings in practice (consequential validity). In practice, reliability and validity concerns are not easily separated.
+
+As an example, wine judges who rate vintages might be assumed to have valid ratings if and only if they agree. The assumption of validity upon consensus is expedient when there is no absolute measure available (as with voting in a democracy). In such cases, reliability and validity are intertwined, and the design of the model presented here is to make this connection explicit using an epistemological simplification.
+
+The concept of knowledge as justified true belief has known issues \cite{gettier1963justified}, but the general idea is useful here. Knowledge implies truth, which means that we should distinguish between a true (valid) classification for a subject and the assigned classification. More subtly, we must distinguish between a correct rating assignment based on justified belief and a correct assignment "by accident." The proportion of cases for each of these become model parameters.
+
+# The $t$-$a$-$p$ Rater Model
+
+Suppose we have $N$ subjects, assumed to each belong to one of two categories Class 1 or Class 0. The latter class could include any category that is not Class 1; think of Class 0 as Class "Other." Each subject is independently assigned one of the two categories by each of $R$ observers (raters). Assigned categories are distinguished from true classes in notation by a squiggle in front of the rater assessments: ~Class 1 or ~Class 0 for ratings, and Class 1 or Class 0 for the true values.
+
+We will say that a rater makes an *accurate* assignment of ~Class 1 or ~Class 0 for a subject if (1) the assigned class is the true class, and (2) the rater has justification for the choice (justified true belief). Inaccurate ratings are those where one of the two conditions fails. A rater can still be correct even if the rating is inaccurate, like guessing the result of a coin toss.
+
+The model lends itself to a tree diagram that illustrates the three nested latent variables as conditional probabilities: (1) the true Class 1 rate $t$, (2) rater accuracy $a$, and (3) the probability of choosing ~Class 1 when rating inaccurately. 
+
+\begin{figure}
+\centering
+\begin{tikzcd}
+ &  & \text{Subject} \arrow[ld, "t"'] \arrow[rd, "t'"] & & \\
+ & \text{Class 1} \arrow[ld, "a"'] \arrow[rd, "a'"] & & \text{Class 0} \arrow[ld, "a'"'] \arrow[rd, "a"] & \\
+\sim \text{Class 1} & & \text{Random} \arrow[ld, "p"'] \arrow[rd, "p'"] &  & \sim \text{Class 0} \\
+& \sim \text{Class 1} & & \sim \text{Class 0} &                    
+\end{tikzcd}
+
+\caption{The $t$-$a$-$p$ binary classification model, where $t$ is the proportion of subjects that are Class 1, $a$ is rater accuracy, the probability that a classification is correct because of justified true belief, and $p$ is the proportion of inaccurate ratings of $\sim$Class 1.} \label{fig:tree}
+\end{figure}
+
+Each rating is conditional on a subject's true classification (Class 1 or Class 0), which will often be unknown, so that we can only observe the rater-assigned categories $\sim \text{Class 1}$ and $\sim\text{ Class 0}$. The rating data will be denoted by $s_{ij}$, where $i = 1 \dots N$ are the subjects and $j = 1 \dots R$ are the raters, who independently classify subjects as 1 or 0 according to the ~Class 1 or ~Class 0 assignment, respectively. This is convenient, since $k_i := \sum_j s_{ij}$ is the number of ~Class 1 ratings for subject $i$, and the average of the ratings is $\text{E}[\sim \text{Class 1}] = \sum{s_{ij}}/(NR)$.  
+
+The tree diagram in figure \ref{fig:tree} models the assignments of $s_{ij}$ and can be read by multiplying the conditional probabilities on the edges from the top down to find the probability that a given classification is ~Class 1. We use the convention throughout that the complement of probability $x$ is $x' := 1-x$ .
+
+If a subject is not classified accurately, the classification for that rater is assumed to be made at random, with probability $p$ of choosing ~Class 1 regardless of the true class. So the conditional probability of a ~Class 1 classification when the subject actually is Class 1 is $\text{Pr}(\sim \text{Class 1} | \text{Class 1}) = a + a'p$. Similarly,  $\text{Pr}(\sim \text{Class 1} | \text{Class 0}) = a'p$. This model is simplified in that it assumes that guess rates for the two classes are the same independent of the true classification. More complex models are natural extensions.
+
+The accuracy rate $a$ will affect the subject distributions. If $a = 0$ the ratings will be distributed as $\text{Bernoulli}(p)$,  independently of the subjects being rated. If $a=1$, then all raters agree on the true value for each subject. Therefore the way we can reconstruct $a$ from data is through the distribution of the within-subject ratings. The method used here can be seen as a latent class model with binomial mixture distributions. For a nice discussion of these ideas in practice see \cite{grilli20155}, which helpfully notes that binomial mixtures are statistically identifiable if the number of cases exceeds a low threshold \cite{mclachlan2000wiley}. More generally, see \cite{agresti2003categorical} chapter 14 on mixture models for discrete data.
+
+We would like to know the true proportion $t$ of the subjects belonging to Class 1 regardless of how they were rated, rater accuracy $a$, and the proportion $p$ of inaccurate assignments that are ~Class 1. That goal describes the general model illustrated in the following section. A hierarchical version is given subsequently.  
+
+# Fitting the Model
+
+Given a data set $s_{ij}$, we can fit a general model to estimate the three parameters $t$, $a$, and $p$ using maximum likelihood. The log likelihood function for the binomial mixture described by figure \ref{fig:tree} with $N$ subjects and $R>1$ raters is
+
+$$
+\ell(t,a,p;k_1, \dots,k_N) = \sum_{i = 1}^N \log \left( t\binom{R}{k_i}(a + a'p)^{k_i}(a'p')^{R-k_i} + t'\binom{R}{k_i}(a'p)^{k_i}(1-a'p)^{R-k_i} \right)  \tag{1} \label{eq:tap_model}
+$$
+
+where $k_i=\sum_{j}s_{ij}$ the number ~Class 1 ratings for subject $i$. The sum over the logs is justified by the assumption that ratings are independent. It is straightforward to implement the function in the Bayesian programming language Stan \cite{carpenter2017stan}, using uniform $(0,1)$ priors for the three parameters (see the Discussion section to access the source code).
+
+To test the computational feasibility of this method, ratings were simulated using a range of values of $t$, $a$, and $p$. The 729 trials each simulated 300 subjects with five raters each, using all combinations of values ranging from .1 to .9 in increments of .1 for each of $t$, $a$, and $p$. The Stan engine uses a Markov chain Monte Carlo (MCMC) algorithm to gather representative samples from the joint probability density of the three parameters. Each run used 1,000 iterations (800 after warm-up) with four chains each.
+
+```{r, tap_sim, fig.width=6, fig.height=3, fig.cap=paste("Box and whisker plots show parameter estimates from simulations of rater data $t$-$a$-$p$ values ranging from .1 to .9. The diagonal line marks perfect estimates.\\label{fig:tap_sim}")}
+if(regenerate == TRUE){
+  param_grid <- expand.grid(t = seq(.1,.9,.1),a = seq(.1,.9,.1),p = seq(.1,.9,.1))
+  
+  n_sims <- nrow(param_grid)
+  N <- 300 # number of subjects
+  R <- 5   # number of raters
+  
+  out <- data.frame()  
+  fixed_model_spec <- stan_model("code/fixed_effects.stan")
+  
+  for(i in 1:n_sims){
+    ratings <- generate_ratings(N, R, param_grid$p[i], param_grid$a[i], param_grid$t[i])  
+    
+    # get the number of Class 1 ratings per subject in a vector
+    counts <- ratings %>% 
+      group_by(SubjectID) %>% 
+      summarize(k = sum(RatedClass)) %>% 
+      select(k) %>% 
+      pull()
+    
+    kappa <- sqrt(fleiss(counts,R))
+      
+    fixed_model <- sampling(object = fixed_model_spec, 
+                              data = list(N = N, R = R, S = 1, count = counts), 
+                              iter = 1000,
+                              warmup = 200,
+                              thin = 1)
+      
+      stats <- rbind( broom::tidy(fixed_model),
+                      data.frame(term = "root kappa",estimate = kappa, std.error = NA,
+                                 stringsAsFactors = FALSE)) %>% 
+                      mutate(p = param_grid$p[i], a = param_grid$a[i], t = param_grid$t[i])
+    
+      out <- rbind(out,stats)
+    }
+    write_csv(out,"data/fit_test_sim.csv")
+} else {
+  out <- read_csv("data/fit_test_sim.csv")
+}
+
+# format for plotting
+pdf <- out %>% 
+#  filter(a > .2) %>% 
+  select(parameter = term, value = estimate, actual_p = p, actual_a = a, actual_t = t) %>% 
+  spread(parameter, value) %>% 
+  rename(estimated_a = accuracy, estimated_p = p, kappa_a = `root kappa`, estimated_t = t) %>% 
+  mutate(Sim = row_number()) %>% 
+  gather(parameter, value, -Sim) %>% 
+  separate(parameter, into = c("type","parameter"), sep = "_") %>% 
+  spread(type, value)
+
+  ggplot(pdf, aes(x = actual, y = estimated, group = actual)) +
+    geom_boxplot() +
+    geom_abline(slope = 1, intercept = 0) +
+    facet_grid(. ~ parameter) +
+    theme_bw()
+```
+
+The accuracy measure $a$ and the Class 1 "guess rate" $p$ are stable across scenarios in figure \ref{fig:tap_sim}, but the estimated true fraction of Class 1 cases $t$ is sensitive to values of $a$ near zero. To see this, substitute $a = 0$ into the likelihood function to get
+
+$$
+\begin{aligned}
+\ell(t,p;a = 0, k_1, \dots,k_N) &= \sum_{i = 1}^N \log \left( t\binom{R}{k_i}p^{k_i}(p')^{R-k_i} + t'\binom{R}{k_i}p^{k_i}(p')^{R-k_i} \right) \\
+&= \sum_{i = 1}^N \log \left( \binom{R}{k_i}p^{k_i}(1-p)^{R-k_i}  \right)
+\end{aligned}
+$$
+
+showing that $t$ is underdetermined when $a = 0$, and we should expect poor behavior as $a$ nears zero. This is intuitive: if the raters are only guessing, they should give us no information about the Class 1 rate. If the data in figure \ref{fig:tap_sim} are filtered to $a > .2$ the estimates of $t$ greatly improve. Aside from extreme values of $a$ affecting the estimation of $t$, a visual inspection of the scatter plots of the parameter estimates shows no correlations. 
+
+```{r,include=FALSE}
+out %>% 
+  select(parameter = term, value = estimate, actual_p = p, actual_a = a, actual_t = t) %>% 
+  spread(parameter, value) %>% 
+  rename(estimated_a = accuracy, estimated_p = p, kappa_a = `root kappa`, estimated_t = t) %>% 
+  select(starts_with("estimated")) %>% 
+  pairs()
+```
+
+# Expert Raters
+
+The expected fraction of ~Class 1 ratings over all subjects is $\text{E}[\sim \text{Class 1}] = t(a + a'p) + t'a'p = a(t-p) + p$. We focus now on the special case where we set $p = \text{E}[\sim\text{Class 1}]$, which requires that $t = p$: the proportion of ~Class 1 ratings equals the true proportion of Class 1 ratings. Or, equivalently when raters make inaccurate classifications (i.e. guesswork is involved), they pick ~Class 1 in proportion to its actual prevalence in the population. If on average the raters get the proportions correct in this way, we will call them "expert."
+
+Under the expert rater assumption there is one unknown model parameter, $a$, the accuracy of raters. As a shorthand description for models, we capitalize constants and leave sought parameters as lowercase, so the expert rater model is $P$-$a$-$P$, with $P = \text{E}[\sim \text{Class 1}] = \sum s_{ij}/(NR)$.
+
+To make inferences from this model, consider the distribution of ratings as a function of accuracy $a$. With $R$ ratings per subject, the individual subject counts of ~Class 1 ratings $k_i$ can range from 0 to R. The distribution of these $k_i$ counts depends on the true class of the subject if $a>0$. The distribution of ratings is a binomial mixture, with a likelihood function for $a$ and the $i$th subject by
+ 
+$$\text{L}_i(a; k_i, P) = P\binom{R}{k_i}(a + a'P)^{k_i}(a'P')^{R-k_i} + P'\binom{R}{k_i}(a'P)^{k_i}(1-a'P)^{R-k_i}, \tag{2} \label{eq:expert_model}$$
+where $P = \sum{s_{ij}}/(NR)$.
+
+The assumption that cases are judged independently allows us to estimate $a$ with the usual maximum likelihood approach, although this turns out not to be necessary, as we will see in the following section.
+
+# The Fleiss Kappa
+There are several statistical measures of rater agreement in wide use. We focus on the Fleiss kappa \cite{fleiss1971measuring} as a well-known representative of this genre. The kappa is an asymptotic version of Krippendorf's alpha \cite{krippendorff1978reliability} and a multi-rater extension of Scott's pi \cite{scott1955reliability}. The statistic compares the overall distribution of ratings (ignoring subjects) to the average over within-subject distributions. These distributions are used to calculate match (i.e. agreement) rates $m_i$ for each subject $i$, which for a two-category classification looks like
+
+$$
+\begin{aligned}
+m_i &= \frac{ {\binom{k_i}{2}} + {\binom{R - k_i}{2}}}{\binom{R}{2}} \\
+ &= \frac{k_i(k_i-1)+ (R-k_i)(R - k_i-1)}{R(R-1)} \\
+ &= \frac{2k_i^2 - 2k_iR + R^2-R}{R(R-1)}
+\end{aligned}
+$$
+where $k_i$ is the count of Class 1 ratings for the $i$th subject, and $R>1$ is the fixed number of raters for each subject. The match rates are averaged to get $\text{E}[m_i]$ and then a chance correction is applied with
+
+$$
+\kappa = \frac{\text{E}[m_i] - \text{E}[m_*]}{1-\text{E}[m_*]},
+$$
+
+where $\text{E}[m_*]$ is the average match rate ignoring subject distinctions. Under the expert rater assumption, the true rate of Class 1 $t$ is assumed to be $\text{E}[s_{ij}]$,  so $\text{E}[m_*] = t^2 + (1-t)^2$, the asymptotic expected match rate for independent Bernoulli trials with success probability $t$. 
+
+Surprisingly, $\kappa$ has a simple relationship to the expert rater model, where $t$ = $p$. Asymptotically, the average match rates will be defined by $\text{Pr}(k;a,t)$, so it suffices for large $N$ to write the expected match rate as
+
+$$
+\begin{aligned}
+      \text{E}[m(a)] &= \sum_{k=0}^R \frac{2k^2 - 2kR + R^2-R}{R(R-1)}\text{Pr}(k;a,t) \\
+      &= \sum_{k=0}^R \frac{2k^2 - 2kR + R^2-R}{R(R-1)} \left[ t\binom{R}{k}(a + a't)^{k}(a't')^{R-k_i} + t'\binom{R}{k}(a't)^{k}(1-a't)^{R-k} \right] \\
+      &= \frac{2}{R(R-1)} \sum_{k=0}^R k^2 \left[ t \text{ Binom}(R,k,a+a't) + t' \text{ Binom}(R,k,a't) \right] \\
+      &- \frac{2R}{R(R-1)} \sum_{k=0}^R k \left[ t \text{ Binom}(R,k,a+a't) + t' \text{ Binom}(R,k,a't) \right] \\
+      &+ \frac{R(R-1)}{R(R-1)} \sum_{k=0}^R \left[ t \text{ Binom}(R,k,a+a't) + t' \text{ Binom}(R,k,a't) \right] \\
+      &= \frac{2}{R(R-1)} \left[ tR(a+a't)a't'+tR^2(a+a't)^2 + t'R(a't)(1-a't)+t'R^2(a't)^2\right] \\
+      &- \frac{2}{R-1} \left[ tR(a+a't) +  t'R(a't)\right] +1 \\
+      &= 2a^2(t-t^2) + 2t^2 -2t + 1,
+\end{aligned}
+$$
+
+using the moment identities to gather the sums, and an automated algebra simplifier (Wolfram Alpha) in the final step. Here, $t$ and $R$ are fixed, and $m(a)$ is the average match rate over cases, which depends on unknown $a$ and fixed $t = \text{E}[s_{ij}]$. Now we can compute the Fleiss kappa with
+
+$$ 
+\begin{aligned}
+\kappa(a,t) &= \frac{\text{E}[m_i] - \text{E}[m_*]}{1-\text{E}[m_*]} \\
+            &= \frac{2a^2(t-t^2) + 2t^2 -2t + 1 - (t^2+(1-t)^2)}{1-(t^2+(1-t)^2)} \\
+            &= a^2.
+\end{aligned}
+$$
+
+So kappa is the square of accuracy under the expert rater assumption, with constant rater accuracy. The relationship does not depend on the true distribution of Class 1 cases, which has implications for the "Kappa Paradox," which is discussed later. 
+
+Checking this result against simulated ratings generated under the $P$-$a$-$P$ expert rater assumption (i.e. using observed rates of ~Class 1 for both $t$ and $p$), using likelihood function \eqref{eq:expert_model} shows close adherence to theoretical values. For each of 1,225 trials, 500 subjects were assigned simulated ratings with five raters each, where accuracy ranged from .02 to .98 and the Class 1 rate from .02 to .9. The Fleiss kappa is plotted against the rater accuracy used to generate the data in figure \ref{fig:kappa_sim}. 
+
+```{r,kappa_sim, fig.width=3.5, fig.height=2.5, fig.cap=paste("Simulations of rater data with known accuracy on the x-axis, showing Fleiss kappa, with circle markers denoting unbalanced data sets (10% or less in a class). The dark line is accuracy squared, and the dashed reference line is 1:1.\\label{fig:kappa_sim}")}
+if(regenerate == TRUE) {
+ 
+  true_dist <- seq(.02,.5,.02) #c(.5,.5)
+  p <- seq(.02,.98,.02) # rater accuracy
+  Nsim <- 500  # number of subjects rated
+  Nraters <- 5 # number of raters
+  
+  
+  
+  out <- expand.grid(true = true_dist, p = p, N = Nsim, lambda = NA, lambda_sd = NA, fleiss = NA, fleiss_sd = NA)
+  
+  for(i in 1:nrow(out)){
+  
+    kappas <- sim_raters(c(out$true[i],1-out$true[i]),
+                         out$p[i], Nsim, Nraters) %>%
+      FUReliability::pairwise_lambda() %>%
+      summarize(N = n(), # should be the same as Nsim
+                lambda = mean(lambda_kappa),
+                lambda_sd = sd(lambda_kappa),
+                fleiss = mean(fleiss_kappa),
+                fleiss_sd = sd(fleiss_kappa))
+  
+    out$N         <- kappas$N
+    out$lambda[i] <- kappas$lambda
+    out$fleiss[i] <- kappas$fleiss
+    out$lambda_sd[i] <- kappas$lambda_sd
+    out$fleiss_sd[i] <- kappas$fleiss_sd
+  }
+
+  write_csv(out, "data/uniform_sim.csv")
+} else {
+  out <- read_csv("data/uniform_sim.csv")
+}
+  
+
+gout_est <- out %>% 
+  select(-lambda_sd,-fleiss_sd) %>% 
+  gather(kappa, estimate, lambda, fleiss) 
+
+gout_sd <- out %>% 
+  select(-lambda,-fleiss) %>% 
+  rename(lambda = lambda_sd, fleiss = fleiss_sd) %>% 
+  gather(kappa, sd, lambda, fleiss) 
+
+gout <- gout_est %>%
+  left_join(gout_sd) %>% 
+  mutate(sd = ifelse(row_number() %% 7 == 0, sd, NA),
+         error = estimate  - p,
+         unbalanced = true <= .1) %>% 
+  filter(kappa == "fleiss")
+
+ggplot(gout, aes(x = p, y = estimate, shape = unbalanced)) +
+  geom_point(size = 1, color = "#555555") +
+  scale_shape_manual(values=c(20,1))+
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted") +
+  theme_bw() +
+  xlab("Rater Accuracy") +
+  ylab("Fleiss Kappa") +
+  geom_line(aes(x = p, y = p^2), size = 1) +
+  theme(legend.position = "none")
+```
+
+The instances in figure \ref{fig:kappa_sim} with relatively fewer Class 1 cases have larger measurement error, as we would expect, but the shape of the relationship does not depend on that fraction. The square relationship between accuracy and kappa is convenient in that it allows us to capture rater accuracy with a simple computation when the expert model is correct. Even when the expert rater assumption fails to hold, other simulations (omitted here) show that kappa's relationship to rater accuracy is robust in the general $t$-$a$-$p$ model. 
+
+Note that while counting agreements between raters is an intuitive measure of reliability, it has some odd properties. Suppose that two thermometers agree on the room's temperature being 72 degrees. We consult a third thermometer, and find that it agrees with the first two. How should we quantify the increase in evidence about the temperature? If counting the number of thermometers, the evidence increased by 50%. If counting agreements, we started with one agreement between two instruments, and now have three agreements. Should we say that the evidence has tripled?
+
+The third of those agreements is logical rather than empirical, since it follows by transitivity (if A agrees with B, and B agrees with C, then necessarily A agrees with C). Generally, the relationship between counts of raters in agreement $k$ and the count of agreements between these is quadratic: $k(k-1)/2$, with the majority of these due to transitivity. So in some sense, agreement counts are the *square* of the weight of evidence, and therefore the square root relationship between kappa and rater accuracy is intuitively satisfying. The relationship also demonstrates that reliability and validity are intertwined.
+
+Other properties of the Fleiss kappa can be found in \cite{fleiss2003statistical}, chapter 18, such as kappa's equivalence to an intraclass correlation coefficient. Note that $kappa$ can be negative, whereas $a^2$ obviously cannot be. In those cases, neither the general $t$-$a$-$p$ model or the expert rater version a good fit for the data. Negative kappas happen when within-subject rater agreement is *lower* than we would expect by chance. This can happen with biased raters. For example ratings of a political book may be bimodal. Adversarial raters are another possibility. For these situations, we need a more complex model, for example by adding another latent variable to capture rater bias. 
+
+# Example: Wine Judging
+
+In \cite{hodgson2008examination} results from a wine-tasting event were analyzed, finding evidence that the judges were better able to distinguish poor wine than excellent wine. Upon request, the author sent me some of the data used, and I replicated that finding in \cite{eubanks2017re} using kappa-based methods. The data comprises ratings of 183 wines, each sampled by four (possibly different) judges and classified by them into one of four categories: no medal, bronze medal, silver medal, or gold medal. The data are coded as one to four, respectively.
+
+To create binary classifications, we apply cut points of 1, 2, and 3, and use the cumulative counts as Class 1 (e.g. with a cut point of 1, Class 1 comprises the ratings of 1, and Class 0 is ratings 2 to 4, etc.). This is a common way to deal with ordinal scales. 
+
+The expert rater assumption can be tested by comparing estimated $t$ to the "guess" rate $p$ using the general $t$-$a$-$p$ model. Recall that the expert model assumes that $t = p$. The general model was implemented using the likelihood function \eqref{eq:tap_model} coded into Stan. Four chains with 1000 iterations each produced the results shown here.  
+
+```{r, wine_tap_estimates, fig.width=6, fig.height=2.5, fig.cap=paste("Estimated parameter values for the $t$-$a$-$p$ model, showing estimated accuracy and root kappa on the left, and estimated true proportion $t$ of Class 1 compared to estimated $p$. Each statistic was generated for cut-points 1-3 on the ordinal 1-4 scale. Error bars show two standard errors of the estimate.\\label{fig:wine_tap_estimates}")}
+if(regenerate == TRUE) {
+  ratings <- read_csv("data/Wine Ratings.csv") 
+  
+  fixed_model_spec <- stan_model("code/fixed_effects.stan")
+  
+  out <- data.frame()
+  
+  for(i in 1:3){
+  
+    counts <- rowSums(ratings <=i)
+    kappa <- sqrt(fleiss(counts,4))
+    
+    fixed_model <- sampling(object = fixed_model_spec, 
+                            data = list(N = length(counts), R = 4, S = 1, count = counts), 
+                            iter = 1000,
+                            warmup = 200,
+                            thin = 1)
+    
+    stats <- broom::tidy(fixed_model) %>% mutate(Cut = i)
+  
+    out <- rbind(out,stats, data.frame(term = "root kappa",estimate = kappa, std.error = NA, Cut = i, stringsAsFactors = FALSE))
+  }
+  write_csv(out, "data/wine_fit.csv")
+} else {
+  out <- read_csv("data/wine_fit.csv")
+}
+
+# add plotting info
+out <- out %>% 
+  mutate(Type = case_when(term %in% c("p","t") ~ "Rates",
+                          TRUE ~ "Accuracy"),
+         term = gsub("accuracy","a",term)) 
+
+ggplot(out, aes(x = Cut, y = estimate, 
+                ymin = estimate -2*std.error, ymax = estimate + 2*std.error,
+                shape = term)) +
+  geom_point(position = position_dodge(width = .4), size = 2) +
+ # geom_line(position = position_dodge(width = .05)) +
+  geom_errorbar(width = 0,position = position_dodge(width = .4)) +
+  theme_bw() +
+  scale_shape_manual(values = c(15,0,1,16))+
+  facet_grid(. ~ Type) +
+  xlab("Cut Point") +
+  ylab("Estimate") +
+  scale_x_continuous(breaks = 1:3)
+```
+
+The estimated parameters in figure \ref{fig:wine_tap_estimates} confirm that rater accuracy declines as the classifications move from the low end (no medal) to the high end (gold medal), but suggest that expert rater assumption holds for cut points at 1 and 2. It seems as if the wine judges are proficient at spotting poor vintages but not excellent ones. Tastes may vary too much to give much meaning to the idea of a gold-medal wine.
+
+Another way to evaluate model fit is to compare distributions of rating counts over the binomial range. Here we look at wine ratings of no medal and bronze versus silver or gold (a cut point of 2).
+
+```{r,wine_distro, fig.width=5, fig.height=2.5, fig.cap=paste("Probability of k ratings out of four for Class 1, estimated from wine ratings, showing observed proportions, the (random) distribution when within-subject variations are ignored, and values derived from either the $t$-$a$-$p$ model or under the expert rater assumption (expert). For the first two, bootstrapped 95% confidence intervals are shown.\\label{fig:wine_distro}")}
+if(regenerate == TRUE){
+  
+  ratings <- read_csv("data/Wine Ratings.csv")
+  counts <- rowSums(ratings <=2)
+  df <- get_distributions(counts,4)
+  write_csv(df, "data/wine_comparison.csv")
+} else {
+  df <- read_csv("data/wine_comparison.csv")
+}
+
+plot_distributions(df)
+```
+
+The random model assumes no within-subject correlations, and figure \ref{fig:wine_distro} shows this is not plausible given the data. Both the expert rater model and the general $t$-$a$-$p$ model produce distributions of ratings that are in line with the observed distribution. Given that, we prefer the single-parameter model that estimates only $a$ to the three parameter $t$-$a$-$p$ version. This example illustrates the reasonableness of the expert rater assumption for real data.
+
+Instead of using cut-points on the ordinal scale, rating values can be examined pairwise to compute rater accuracy conditional on a chosen pair of rating values, like no medal (rating 1) versus bronze medal (rating 2).
+
+```{r, results = 'asis'}
+ ratings <- read_csv("data/Wine Ratings.csv") %>% 
+  mutate(SubjectID = row_number()) %>% 
+  gather(RaterID, Rating, -SubjectID)
+ 
+print(xtable(pairwise_accuracy(ratings), digits = c(0,0,2,2,2),caption = "Pairwise conditional rater accuracy (square root of kappa) for wine ratings. Rating values 1 to 4 are denoted by row and column labels, so the top left cell shows accuracy in distinguishing 1s from 2s.", label = "tab:wine_accuracy_table"), comment = FALSE, include.rownames=FALSE)
+```
+
+Tables of conditional accuracy are useful for categorical scales to identify categories that appear similar to raters. For ordinal scales, we should assume that close ratings (the main diagonal of table \ref{tab:wine_accuracy_table}) like 1 versus 2 are more difficult than far ratings like 1 versus 4. That pattern is evident in table \ref{tab:wine_accuracy_table}, reinforcing the finding of greater accuracy for low ratings versus high ones. But the table shows that the wine judges really can tell the difference between an unworthy vintage and a gold medal one.
+
+# Hierarchical Models
+
+To extract more information from the rating samples we can move beyond single-parameter statistics to simultaneously estimate the probability that a given subject is Class 1 and the accuracy of each rater using a hierarchical model \footnote{These are sometimes called "random effects" models. As noted in  \cite[p.~523]{agresti2003categorical}, fixed versus random effects are not good descriptions for Bayesian models, and this is elaborated on in \cite[p.~245]{gelman2006data} }. Here, we fix $P = \text{E}[s_{ij}]$, so this is a $t_i$-$a_i$-$P$ model. The likelihood function is now based on individual ratings rather than binomial sums, with
+
+$$ 
+\begin{aligned}
+\text{L}(a_j,t_i;s_{ij},P) &= s_{ij}(t_ia_j+a'_jP) + s_{ij}'(1 -t_ia_j -a'_jP) \\
+&= (-1)^{s_{ij}'}|a_j(t_i -P)| + s_{ij}P + s_{ij}'P' \\
+\end{aligned}
+$$
+
+where $t_i \epsilon(0,1)$ is the estimated probability that the $i$th case is Class 1, $a_j$ is the estimated accuracy of the $j$th rater, and constant $P$ is the known fraction of ~Class 1 ratings in the whole data set. 
+
+To interpret induced parameters in the context of the model in figure \ref{fig:tree}, a slight modification to the likelihood function is useful. The generative model in figure \ref{fig:tree} is conditional on the true class being binary, not a probability between zero and one. This departure from the model is necessary computationally, so that the truth probability of each subject can smoothly evolve to maximize likelihood, but in practice, we'd like the values of $t_i$ to be *close* to zero or one when computing likelihoods. This is accomplished using a soft threshold on $t_i$ with a sigmoid $\text{sig}_d(t) := 1/(1 + e^{-d(t-.5)})$, where $d$ is a discrimination parameter that adjusts steepness. The final likelihood function is 
+
+$$ 
+\text{L}(a_j,t_i;s_{ij},P) = (-1)^{s_{ij}'}|a_j(\text{sig}_d(t_i) -P)| + s_{ij}P + s_{ij}'P'. \tag{3} \label{eq:re_model}
+$$
+
+Inference of the $N + R$ parameters maximizes likelihood using \eqref{eq:re_model} assuming that each rating is independent of the others so that total probability is the product of the individual rating probabilities. 
+
+To test the model $N=1000$ subjects with $R=5$ raters each were simulated with a Class 1 rate of $p=.20$, and with rater accuracies of .1, .3, .5, .7, and .9. The sigmoid discrimination parameter was set to $d=30$. The model was specified in the Stan programming language, with four chains of 1000 iterations each, the first 200 being discarded as warm-up samples to control auto-correlation. 
+
+```{r,sim_truth, fig.width=7, fig.height=2.5, fig.cap=paste("(A) Estimates of individual rater accuracy with sample distribution and highlighed 90% coverage intervale with mean (dot) and true value (diamond), and (B) Histogram showing side-by-side histograms for Class 1 and Class 0 subjects by estimated probability of Class 1 using estimates  from a $t_i$-$a_i$-$P$ model on on 1000 simulated subjects with five raters each, with $t = p = .4$. \\label{fig:sim_truth}")}
+if(regenerate == TRUE){
+  re_model_spec <- stan_model("code/individual_random_effects_fixed_p.stan")
+  
+  #ratings <- read_csv("data/ind_rem.csv")
+  ratings <- generate_ratings(N = 1000, R = 5, p = .4, a = c(.1,.3,.5,.7,.9)) # p = prob(true class 1)
+  
+  re_model <- rstan::sampling(object = re_model_spec, 
+                              data = list(N = nrow(ratings), 
+                                          R = length(unique(ratings$RaterID)), 
+                                          S = length(unique(ratings$SubjectID)), 
+                                          rating = ratings$RatedClass,
+                                          P = mean(ratings$RatedClass),
+                                          rater_index = ratings$RaterID,
+                                          subject_index = ratings$SubjectID), 
+                              iter = 1000,
+                              warmup = 200,
+                              thin = 1)
+  
+  
+  saveRDS(re_model,"data/ind_rem.RDS")
+  write_csv(ratings, "data/ind_rem.csv")
+} else {
+  re_model <- readRDS("data/ind_rem.RDS")
+  ratings <- read_csv("data/ind_rem.csv")
+}
+# take a look 
+# launch_shinystan(re_model)
+
+# get the coefficients and add them to the datafarme
+
+re_model_coefs <- broom::tidy(re_model)
+
+ rater_acc    <- re_model_coefs %>% 
+  filter(str_detect(term, "accuracy")) %>% 
+   separate(term, into = c("junk","RaterID"), sep = "\\[") %>% 
+   mutate(RaterID = as.integer(gsub("\\]","", RaterID))) %>% 
+   select(RaterID, AccEst = estimate, SE = std.error)
+ 
+  class1_probs    <- re_model_coefs %>% 
+  filter(str_detect(term, "truth")) %>% 
+   separate(term, into = c("junk","SubjectID"), sep = "\\[") %>% 
+   mutate(SubjectID = as.integer(gsub("\\]","", SubjectID))) %>% 
+   select(SubjectID, Class1Prob = estimate)
+
+ ratings <- ratings %>% 
+    left_join(class1_probs) %>% 
+    left_join(rater_acc)
+
+# plot accuracies
+#library(tidybayes)
+p1 <- re_model %>%
+  spread_draws(accuracy[i]) %>%
+  rename(RaterID = i) %>% 
+  left_join(ratings %>% select(RaterID, Accuracy) %>% distinct()) %>% 
+  ggplot(aes(y = reorder(factor(RaterID),Accuracy), x = accuracy)) +
+  stat_halfeye(.width = c(.90, .90), size = 1) + 
+  geom_point(aes(x = Accuracy), shape =5, size = 3) +
+  theme_bw() +
+#  (axis.text.y=element_blank(),
+#        panel.background = element_blank(),
+#        panel.grid.major.x =  element_blank(),
+#        panel.grid.major.y = element_line( size=.5, color="black" ) ) +
+  xlab("Rater Accuracy") +
+  ylab("Rater") 
+ 
+   
+#plot the estimated probabililties of class 1
+p2 <- ggplot(ratings %>% 
+         select(SubjectID,Class1Prob,TrueClass) %>% 
+         group_by(SubjectID,Class1Prob,TrueClass) %>% 
+         distinct() %>% ungroup(), aes(x = Class1Prob, fill = as.factor(TrueClass))) +
+  geom_histogram( position = "dodge", color = "black", bins = 10) +
+  theme_bw() +
+#  scale_y_log10() +
+  scale_fill_manual(values=c("gray","white")) +
+  labs(fill="Class") +
+  xlab("Estimated Probability of Class 1") +
+  ylab("")
+
+plot_grid(p1, p2, labels = c('A', 'B'))
+```
+
+For a simulated data set of 5000 ratings analyzed in figure \ref{fig:sim_truth}, the cases are separated quite well even with only five ratings each. The estimated class probabilities $t_i$ on the horizontal axis take into account estimated rater accuracy, which is imputed for each rater simultaneously. The distributions of posterior samples from the Stan output shows that the parameter estimates recapture individual rater accuracy from the simulated ratings. This does not happen without the soft threshold function to nudge the $t_i$s toward zero or one. For smaller data sets, the estimates become noisier. The estimates in figure \ref{fig:sim_truth2} have only 100 subjects with three raters each, with randomly chosen accuracies. It shows much less certainty about the estimates.
+
+```{r,sim_truth2, fig.width=7, fig.height=2.5, fig.cap=paste("(A) Estimates of individual rater accuracy with sample distribution and highlighed 90% coverage intervale with mean (dot) and true value (diamond), and (B) Histogram showing side-by-side histograms for Class 1 and Class 0 subjects by estimated probability of Class 1 using estimates from a $t_i$-$a_i$-$P$ model on 100 simulated subjects with three raters each, with $t = p = .4$.\\label{fig:sim_truth2}")}
+if(regenerate == TRUE){
+  re_model_spec <- stan_model("code/individual_random_effects_fixed_p.stan")
+  
+  ratings <- read_csv("data/ind_rem2.csv")
+  #ratings <- generate_ratings(N = 100, R = 3, p = .4, a = c(2,2)) # p = prob(true class 1)
+  
+  re_model <- rstan::sampling(object = re_model_spec, 
+                              data = list(N = nrow(ratings), 
+                                          R = length(unique(ratings$RaterID)), 
+                                          S = length(unique(ratings$SubjectID)), 
+                                          rating = ratings$RatedClass,
+                                          P = mean(ratings$RatedClass),
+                                          rater_index = ratings$RaterID,
+                                          subject_index = ratings$SubjectID), 
+                              iter = 1000,
+                              warmup = 200,
+                              thin = 1)
+  
+  
+  saveRDS(re_model,"data/ind_rem2.RDS")
+  write_csv(ratings, "data/ind_rem2.csv")
+} else {
+  re_model <- readRDS("data/ind_rem2.RDS")
+}
+# take a look 
+# launch_shinystan(truth_model)
+ratings <- read_csv("data/ind_rem2.csv")
+# get the coefficients and add them to the datafarme
+
+re_model_coefs <- broom::tidy(re_model)
+
+ rater_acc    <- re_model_coefs %>% 
+  filter(str_detect(term, "accuracy")) %>% 
+   separate(term, into = c("junk","RaterID"), sep = "\\[") %>% 
+   mutate(RaterID = as.integer(gsub("\\]","", RaterID))) %>% 
+   select(RaterID, AccEst = estimate, SE = std.error)
+ 
+  class1_probs    <- re_model_coefs %>% 
+  filter(str_detect(term, "truth")) %>% 
+   separate(term, into = c("junk","SubjectID"), sep = "\\[") %>% 
+   mutate(SubjectID = as.integer(gsub("\\]","", SubjectID))) %>% 
+   select(SubjectID, Class1Prob = estimate)
+
+ ratings <- ratings %>% 
+    left_join(class1_probs) %>% 
+    left_join(rater_acc)
+
+# plot accuracies
+#library(tidybayes)
+p1 <- re_model %>%
+  spread_draws(accuracy[i]) %>%
+  rename(RaterID = i) %>% 
+  left_join(ratings %>% select(RaterID, Accuracy) %>% distinct()) %>% 
+  ggplot(aes(y = reorder(factor(RaterID),Accuracy), x = accuracy)) +
+  stat_halfeye(.width = c(.90, .90), size = 1) + 
+  geom_point(aes(x = Accuracy), shape =5, size = 3) +
+  theme_bw() +
+#  (axis.text.y=element_blank(),
+#        panel.background = element_blank(),
+#        panel.grid.major.x =  element_blank(),
+#        panel.grid.major.y = element_line( size=.5, color="black" ) ) +
+  xlab("Rater Accuracy") +
+  ylab("Rater") 
+ 
+   
+#plot the estimated probabililties of class 1
+p2 <- ggplot(ratings %>% 
+         select(SubjectID,Class1Prob,TrueClass) %>% 
+         group_by(SubjectID,Class1Prob,TrueClass) %>% 
+         distinct() %>% ungroup(), aes(x = Class1Prob, fill = as.factor(TrueClass))) +
+  geom_histogram(position = "dodge", color = "black", bins = 15) +
+  theme_bw() +
+  scale_fill_manual(values=c("gray","white")) +
+  labs(fill="Class") +
+  xlab("Estimated Probability of Class 1") +
+  ylab("")
+
+plot_grid(p1, p2, labels = c('A', 'B'))
+```
+
+If the model fits the data, the examples show it is possible to recover latent true class probabilities and individual rater accuracies, but a fairly large number of ratings are required to obtain small error bounds. 
+
+In addition to general models like $t$-$a$-$p$, and the hierarchical model illustrated in this section, mixed effects models are straightforward to construct. For example, a $t$-$a_i$-$p$ model can take individual rater accuracies into account when estimating $t$ and $p$. This will shrink the accuracy parameters toward their mean, so they are no longer usable as estimates for individual raters.
+
+# Example: College Writing Assessments
+
+Here we analyze 6,718 instructor ratings of college student writing, with at least three ratings per student and at least thirty ratings per instructor. These data were the basis for an example in \cite{eubanks2017re}, where kappa-based reliability was studied, and in a more general validity study \cite{eubanksforthcoming}. The data set used here has been simplified for illustration purposes. 
+
+The scale used to rate student writing is 1 to 5, tracking development of college writers over four years. The one rating means "not yet doing college-level work," and the five rating means "writing at the level we expect of graduates." To analyze this ordinal data set, we use cut points as before, and estimate parameters with the $t$-$a$-$p$ model.
+
+```{r,dasl_tap_estimates, fig.width=6, fig.height=2.5, fig.cap=paste("Estimated parameter values for the $t$-$a$-$p$ model on writing assessment data, showing estimated accuracy and root kappa on the left, and estimated true proportion $t$ of Class 1 compared to estimated $p$. Each statistic was generated for cut-points 1-4 on the ordinal 1-5 scale. Error bars show two standard errors of the estimate.\\label{fig:dasl_tap_estimates}")}
+if(regenerate == TRUE) {
+  dasl <- get_dasl_data("data/dasl.csv") 
+  fixed_model_spec <- stan_model("code/fixed_effects_var_raters.stan")
+  
+  
+  out <- data.frame()
+  
+  for(i in 1:4){
+
+    ratings <- dasl %>% 
+      group_by(SubjectID) %>% 
+      summarize(n_raters = n(),
+                count    = sum(Rating <= i))
+    
+    kappa <- sqrt(fleiss(ratings$count,ratings$n_raters))
+    
+    fixed_model <- sampling(object = fixed_model_spec, 
+                            data = list(N = nrow(ratings), 
+                                        n_raters = ratings$n_raters, 
+                                        count = ratings$count), 
+                            iter = 1000,
+                            warmup = 200,
+                            thin = 1)
+    
+    stats <- broom::tidy(fixed_model) %>% mutate(Cut = i)
+    
+    out <- rbind(out,stats, data.frame(term = "kappa root",estimate = kappa, std.error = NA, Cut = i, stringsAsFactors = FALSE))
+  }
+  write_csv(out, "data/dasl_fit.csv")
+} else {
+  out <- read_csv("data/dasl_fit.csv")
+}
+
+out <- out %>% 
+  mutate(Type = case_when(term %in% c("p","t") ~ "Rates",
+                          TRUE ~ "Accuracy"),
+         term = gsub("accuracy","a",term))
+
+ggplot(out, aes(x = Cut, y = estimate, 
+                ymin = estimate -2*std.error, ymax = estimate + 2*std.error,
+                shape = term)) +
+  geom_point(position = position_dodge(width = .4), size = 2) +
+ # geom_line(position = position_dodge(width = .05)) +
+  geom_errorbar(width = 0,position = position_dodge(width = .4)) +
+  theme_bw() +
+  scale_shape_manual(values = c(15,0,1,16))+
+  facet_grid(. ~ Type) +
+  xlab("Cut Point") +
+  ylab("Estimate")
+```
+
+Accuracy estimates in figure \ref{fig:dasl_tap_estimates} match the root kappa well, and confirm what was noted in \cite{eubanks2017re}, that rater agreement was lowest when assessing the standards expected of new students (cut point 1). That finding has led to a faculty program to agree on such standards out of fairness and for the sake of pedagogy. The latent rate parameters $p$ and $t$ show good correspondence for the middle ranges, implying that the expert rater assumption holds there. 
+
+Turning to a hierarchical model $t_i$-$a_i$-$P$ with cut point 3, we can inquire about the estimated accuracy of individual raters. 
+
+```{r,dasl_accuracy, fig.width=3, fig.height=2, fig.cap=paste("Histogram showing counts of binned estimated rater accuracy for a $t_i$-$a_i$-$P$ model on writing assessment data.\\label{fig:dasl_accuracy}")}
+if(regenerate == TRUE){
+  
+  dasl_stats <- get_dasl_stats(3)
+  saveRDS(dasl_stats,"data/dasl_stats.RDS")
+} else {
+  dasl_stats <- readRDS("data/dasl_stats.RDS")
+}
+# take a look 
+# launch_shinystan(truth_model)
+
+dasl_stats$accuracy %>% 
+  ggplot(aes(x = AccEst )) +
+  geom_histogram(fill = "gray", color = "black", bins = 20) +
+  theme_bw() +
+  xlab("Estimated Rater Accuracy") +
+  ylab("") +
+  scale_x_continuous(breaks = seq(0,1,.2))
+```
+
+The histogram in figure \ref{fig:dasl_accuracy} of estimates of individual rater accuracy shows that a few raters have very small values but the majority have $a_i > .5$. 
+
+```{r}
+dasl <- get_dasl_data("data/dasl.csv") 
+
+bad_rater <- which.min(dasl_stats$accuracy$AccEst)
+
+bad_rater_accuracy <- dasl_stats$accuracy$AccEst[bad_rater] %>% round(2)
+
+badly_rated <- dasl %>% 
+  group_by(SubjectID) %>% 
+  summarize(bad = max(RaterID == bad_rater)) %>% 
+  filter(bad == 1) %>% 
+  select(SubjectID) %>% 
+  pull()
+
+comparison <- dasl %>% 
+  filter(SubjectID %in% badly_rated) %>% 
+  mutate(BadRater = (RaterID == bad_rater)) %>% 
+  group_by(SubjectID, BadRater) %>% 
+  summarize(AvgRating = mean(Rating)) %>% 
+  ungroup() %>% 
+  spread(BadRater, AvgRating) %>% 
+  rename(Inaccurate = `TRUE`, Other = `FALSE`) %>% 
+  select(Inaccurate,Other) 
+
+comparison_correlation <- cor(comparison$Inaccurate, comparison$Other) %>% round(2)
+  
+```
+
+The rater with the lowest accuracy, with $a$ = `r bad_rater_accuracy`, still at least correlates positively with other raters, with a Pearson correlation between average ratings of `r comparison_correlation`. The accuracy estimates give us tools for further investigating the data, such as filtering out raters with estimated accuracy of less than one half. 
+
+In addition to estimated rater accuracies $a_j$, the Class 1 probabilities $t_i$ are estimated for each subject. Using the cut-point of three, representing a midpoint in college writing ability on the four-year span, we can compare the estimated probability that a student has not passed this milestone to that student's year of enrollment. 
+
+```{r,dasl_truth_density, fig.height=3, fig.width=4, fig.cap=paste("Smoothed distributions of estimated Class 1 probabilities for rated students at years 1 through 4 of college (top to bottom), where Class 1 means the student has not yet passed midpoint proficiency.\\label{fig:dasl_truth_density}")}
+dasl_stats$truth %>% 
+  ggplot(aes(x = ProbTrue)) +
+    geom_density(color = "black", fill = "gray") +
+    theme_bw() +
+  facet_grid(Year ~ .) +
+  xlab("Pr[writing < midpoint]") +
+  ylab("")
+```
+
+Figure \ref{fig:dasl_truth_density} shows what we intuitively suspect, that most year one students are not at the midpoint rating for writing ability, and most year four students have passed the threshold. 
+
+The $t_i$-$a_i$-$P$ model can be customized to include predictor variables. If we hypothesized that older instructors have more experience in judging student writing, we can introduce that explanatory variable to test the hypothesis. Let the age of the rater for the $i$th rating be $y_i$, and adapt the likelihood function from the hierarchical model to
+
+$$ \text{L}(\beta_0, \beta_1,t_i;s_{ij},y_i,P) = (-1)^{s_{ij}'}|a(y_i)(\text{sig}_d(t_i) -P)| + s_{ij}P + s_{ij}'P',$$
+
+where the individual accuracy parameters for each rater have been replaced by a function we define as
+$a(y_i) = 1/(1 + e^{\beta_0 + \beta_1 y_i})$ containing two parameters $\beta_0$ and $\beta_1$ to estimate. This embeds a logistic regression inside the accuracy parameter. 
+
+In model output where this was attempted, the MCMC sampling converged to a positive $\beta_1$, but with a sampling distribution that extended significantly to the left of zero. As such, there is a hint that accuracy might increase with age, but the analysis does not convincingly demonstrate it. For our purposes here, it shows how the rating model can be flexibly adapted to research questions. 
+
+```{r, include = FALSE}
+if(regenerate == TRUE) {
+  source("code/dasl.R")
+  dasl <- get_dasl_data("data/dasl.csv") 
+  
+  ratings <- dasl %>% 
+    mutate(RatedClass = (Rating <= 3) + 0,
+           age        = as.numeric(scale(RaterAge))) %>% 
+    filter(!is.na(age)) %>% 
+    mutate(SubjectID = as.integer(as.factor(SubjectID)))
+    
+  # stan 
+   age_model<- stan_model("code/individual_accuracy_age.stan")
+   age_samples <- sampling(object = age_model, 
+                            data = list(N = nrow(ratings), 
+                                        S = length(unique(ratings$SubjectID)), 
+                                        rating = ratings$RatedClass,
+                                        P = mean(ratings$RatedClass),
+                                        subject_index = ratings$SubjectID, 
+                                        age = ratings$age),
+                            iter = 1000,
+                            warmup = 200,
+                            thin = 1)
+    
+    stats <- broom::tidy(age_samples)
+
+   write_csv(stats, "data/dasl_age_model.csv")
+} else {
+  stats <- read_csv("data/dasl_age_model.csv")
+}
+
+# launch_shinystan(age_samples)
+
+```
+
+# The Kappa Paradox
+
+It is widely assumed that inter-rater agreement kappas have problems with unbalanced data. However, within the binary classification $P$-$a$-$P$ expert rater model, the (Fleiss) $k = a^2$, which does not directly depend on $t$ or $p$. Figure \ref{fig:kappa_sim} illustrates that while unbalanced data has higher standard error of estimation, the estimates are not biased. Discussions about kappa for unbalanced data have led to a "paradox," which is  analyzed in \cite{krippendorff2013commentary}. There, the problem is illustrated with the following example (page 484).
+
+> Suppose an instrument manufacturer claims to have developed a test to diagnose a rare disease. Rare means that the probability of that disease in a population is small and to have enough cases in the sample, a large number of individuals need to be tested. [...] Suppose two separate doctors administer the test to the same 1,000 individuals. Suppose each doctor finds one in 1,000 to have the disease and they agree in 998 cases on the outcome of the test.
+
+The within-subject agreement rate looks nearly the same as the agreement when drawing ratings at random from the population, so kappa is about zero. The controversy can be summarized in the two points of view: (pro-kappa) the test has zero agreements on test-positive cases, and is therefore unreliable, versus (anti-kappa) almost all the cases are in perfect agreement, therefore the test is reliable. For more context, see \cite{krippendorff2013commentary}.
+
+We can apply the rater model to the example given above. The $t$-$a$-$p$ model was fitted to N = 1,000 samples with R = 2. As described above, 998 of the subjects are assigned ~Class 0 (negative test result) by both raters, and for the remaining two cases they split, with one ~Class 1 and one ~Class 0 each.
+
+If nearly all the ratings $s_{ij}$ are one value, then the likelihood function over rating sums can be approximately reduced to the likelihood function over individual ratings given by
+
+$$ \text{L}(t,a,p;s_{ij}) \approx a(t - p) + p, \tag{4} \label{eq:paradox}$$
+
+so that $\frac{\partial L}{\partial t} = a$, $\frac{\partial L}{\partial a} = t- p$, and $\frac{\partial L}{\partial p} = 1 - a$. Setting these to zero, we obtain  contradictory solutions to the likelihood maximization problem, since the first and last conditions imply that $a=0$ and $a=1$. Additionally, if $t = p$ in \eqref{eq:paradox} (the expert rater assumption), then accuracy $a$ can be any value between zero and one. The contradictory solutions for accuracy reflect the two "paradoxical" positions, and these show up empirically if we solve for the unconstrained parameters. The data are nearly underdetermined with respect to the full $t$-$a$-$p$ model, and the posterior estimate samples show prevarication.
+
+```{r,paradox_tap, fig.width=5, fig.height=2, fig.cap=paste("Results from a $t$-$a$-$p$ model on the kappa paradox data, with (A) density of estimates for accuracy $a$, and (B) density for the difference between estimated $p$ and estimated $t$.\\label{fig:paradox_tap}")}
+
+# the example from the paper: a test with 98 agreements on zero, and two half agreements on 1
+if(regenerate == 1){
+  counts <- c(rep(0,980),rep(1,2))
+  
+  fixed_model_spec <- stan_model("code/fixed_effects.stan")
+  kappa <- fleiss(counts,2)
+      
+  fixed_model <- sampling(object = fixed_model_spec, 
+                              data = list(N = length(counts), R = 2, count = counts), 
+                              iter = 1000,
+                              warmup = 200,
+                              thin = 1)
+  
+  saveRDS(fixed_model,"data/Paradox_samples.RDS")
+} else {
+  fixed_model <- readRDS("data/Paradox_samples.RDS")
+}
+
+# # this plots all three parameters, but accuracy is the most interesting
+#fixed_model %>%
+#  spread_draws(accuracy,t,p) %>%
+#  select(a = accuracy, t, p) %>% 
+#  gather(Parameter, Estimate) %>% 
+#  ggplot(aes(y = Parameter, x = Estimate)) +
+#  stat_halfeye(.width = c(.90, .5)) +
+#  theme_minimal()
+
+a_plot <- fixed_model %>%
+  spread_draws(accuracy,p,t) %>%
+  select(a = accuracy) %>% 
+  ggplot(aes(x = a)) +
+  geom_density(fill = "gray") +
+  theme_bw() +
+  ylab("")
+
+diff_plot <- fixed_model %>%
+  spread_draws(accuracy,p,t) %>%
+  mutate(`p-t` = p-t) %>% 
+  ggplot(aes(x = `p-t`)) +
+  geom_density(fill = "gray") +
+  theme_bw() +
+  ylab("")
+
+plot_grid(a_plot, diff_plot, labels = c('A', 'B'), label_size = 12)
+```
+
+The results in figure \ref{fig:paradox_tap} come from a MCMC summary of samples for the parameters.  Plot A shows a bimodal distribution of accuracy that favors $a \approx 0$ over $a \approx 1$, but also contains a significant proportion of intermediate values (corresponding to the case when $p=t$). Also in agreement with the analysis, the mode for $p - t$ is zero. 
+
+In summary, the general $t$-$a$-$p$ model points us toward two divergent interpretations of the severely unbalanced data: (1) the accuracy is about zero and the results are due almost entirely to test bias, or (2) the accuracy is high, but the prevalence of the condition is very small. These two conclusions correspond to the usual philosophical positions in the paradox's discussion. A third, more subtle, possibility emerges as well: that if we assume the expert rater condition $p = t = \text{E}[s_{ij}]$, then we can't say much about accuracy because of the severe imbalance in cases: kappa could be any number between zero and one. 
+
+The graphs in figure \ref{fig:paradox_tap} show usefulness of MCMC sampling, and serve as a caution against taking mean estimate values as meaningful without inspecting the distribution first.
+
+# Discussion
+
+Rating and classification help us make sense of the world, whether as a medical diagnosis or in asking for restaurant recommendations. A variety of inter-rater statistics and regression models exist to parameterize ratings, but assumptions for these statistics vary considerably, creating a thicket of implications that an unwary user may become snagged in. For example, the Cohen kappa \cite{cohen1960coefficient} allows each rater to have an individual $p_j$. while Gwet \cite{gwet2008computing} approaches unbalanced data sets by assuming that true positive true negative rates classification are equal and common to raters. See \cite{krippendorff2013commentary} for a nice exposition on this topic. 
+
+Contextualizing rater agreement within a generative model like $t$-$a$-$p$ may aid in making assumptions explicit, for example in justifying (or not) the expert rater assumption. The expressiveness and flexibility of the Stan programming language, combined with the transparency of MCMC samples creates a powerful workspace for generating and testing research questions. However, readers are cautioned not to take parameter names like "truth" and "accuracy" too seriously; the reification of classifications requires an epistemological warrant like a validity argument. If it turns out that $p = t$ for modeled data, that does not mean the raters are necessarily experts.
+
+Many types of classification have more than two categories, and the $t$-$a$-$p$ models are designed for binary data. However, this is not a severe limitation. For ordinal data, we can use cut points as with a Rasch analysis, and for both ordinal and categorical data we can compute statistics for each pair of categories, as illustrated with the wine data. See \cite{eubanks2017re} for more examples of that. One could also integrate more outcomes and accompanying parameters into the model. 
+
+In modeling ratings, I highly recommend first modeling simulating data sets before making inferences from real data. This practice will often reveal problems with assumptions or the code used to implement them. Being able to recover known parameters under a particular set of constraints gives us more confidence in empirical results, and we can perform a power analysis that way if desired.
+
+The $t$-$a$-$p$ model and its cousins are asymptotic methods, requiring enough data to form an opinion. One of the many open questions is to assess error characteristics, particularly with smallish data sets. Another interesting question is to explore the relationship between the Fleiss kappa and the full $t$-$a$-$p$ model. The square root relationship to $a$ seems to hold up well even when the expert rater assumption fails. Why? Empirically, it is fascinating that the so-called expert rater assumption actually holds true in the two data sets illustrated here. How generalizable is that finding, and why? How do we modify the model for inexpert raters or to identify adversarial raters? What if we don't believe the ratings are independent? Can we estimate covariance between subjects or raters? For severely unbalanced data, the analysis of the kappa paradox shows that the expert rater assumption will probably hold for artificial reasons; can bootstrapping subsamples of the majority class fix that? Classification problems have a whole literature of their own, entailing summary measurements like sensitivity and specificity. Associating those with the $t$-$a$-$p$ models seems like a useful line of inquiry.
+
+Finally, there is a philosophical and mathematical connection between the latent classification statistics in the models presented here and measures of causality. Figure \ref{fig:tree} is interpreted in the present work as observation causing classification, but we can instead think of $t$ as a causal state like flipping a light switch. In that case, we are solving for $a$ and $p$, which are measures of causality and environmental noise, respectively. A common measure of causality, when translated into figure \ref{fig:tree}, is Pr[~Class 1|Class 1] - Pr[~Class 1|Class 0], as in the probability that the light illuminates when the switch is on minus the probability that it does so when the switch is off. This probability is precisely $a$. More interesting variations occur when we let the conditional causal/accuracy parameter vary, with $a_1$ and $a_0$ denoting the causal/accuracy values for the Class 1 and Class 0 cases, respectively. That idea is developed in \cite{eubankscause}, and the findings there can be recast from causal analysis to categorization.
+
+The files and data needed to reproduce the results in this paper (except for the section on writing assessment) can be obtained from the author (deubanks.office\@gmail.com).
+
+\bibliography{bibliography}
+\bibliographystyle{unsrt}
